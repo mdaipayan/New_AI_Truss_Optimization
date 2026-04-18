@@ -100,38 +100,31 @@ st.sidebar.download_button(
 )
 
 uploaded_file = st.sidebar.file_uploader("⬆️ Load Project (.json)", type=["json"])
-# Guard against re-loading on every rerun — only load when a new file is uploaded
-if uploaded_file is not None and uploaded_file.name != st.session_state.get('_last_loaded_file'):
+if uploaded_file is not None:
     try:
         uploaded_file.seek(0)
         project_data = json.load(uploaded_file)
-
-        # Validate required keys before overwriting session state
-        for key in ('nodes', 'members', 'loads', 'combos'):
-            if key not in project_data:
-                raise KeyError(f"Missing required key '{key}' in project file.")
-
+        
         st.session_state['nodes_data'] = pd.DataFrame(project_data['nodes'])
         st.session_state['members_data'] = pd.DataFrame(project_data['members'])
         st.session_state['loads_data'] = pd.DataFrame(project_data['loads'])
         st.session_state['combos_data'] = pd.DataFrame(project_data['combos'])
         st.session_state['shape_bounds_data'] = pd.DataFrame(project_data.get('shape_bounds', []))
         st.session_state['group_input_val'] = project_data.get('groups', "")
-
-        # Record the filename so this block doesn't re-fire on subsequent reruns
-        st.session_state['_last_loaded_file'] = uploaded_file.name
-        clear_results()
+        
+        clear_results() 
         st.sidebar.success("Project Loaded Successfully!")
-        st.rerun()
-
+        
+        if st.sidebar.button("🔄 Refresh UI to View Loaded Data"):
+            st.rerun()
+            
     except Exception as e:
         st.sidebar.error(f"Error parsing file: {e}")
 
 # ---------------------------------------------------------
 # CACHED SOLVER ENGINE
 # ---------------------------------------------------------
-# NOTE: No cache decorator — TrussSystem is a stateful mutable object that
-# cannot be safely hashed or shared across users via st.cache_resource.
+@st.cache_resource(show_spinner=False)
 def run_structural_analysis(n_df, m_df, l_df, combo_factors, a_type, l_steps):
     ts = TrussSystem()
     node_map = {}
@@ -415,6 +408,127 @@ with col1:
             st.session_state['group_input_val'] = "; ".join(groups)
             clear_results()
 
+    # ── Second row of benchmark buttons ──────────────────────────────────────
+    col_btn5, col_btn6, col_btn7, col_btn8 = st.columns(4)
+    with col_btn5:
+        if st.button("🏟️ Stadium Roof Grid"):
+            # ----------------------------------------------------------------
+            # STANDARD STADIUM DOUBLE-LAYER FLAT GRID SPACE FRAME
+            # Geometry:  Top chord  – 4×4 nodes at z = 3 m, 5 m bay spacing
+            #            Bottom chord – 3×3 nodes at z = 0 m, offset 2.5 m
+            # Supports:  All 9 bottom chord nodes (stadium columns) – pinned
+            # Members:   72 total  (TC-X=12, TC-Y=12, BC-X=6, BC-Y=6, Web=36)
+            # Loads:     Gravity (DL) on all 16 top nodes + wind uplift (WL)
+            # ----------------------------------------------------------------
+
+            # 1. NODES
+            nodes_s = []
+            # Top layer – 4×4 grid, z = 3 m (roof chords, free)
+            for row in range(4):
+                for col in range(4):
+                    nodes_s.append([col * 5.0, row * 5.0, 3.0, 0, 0, 0])
+            # Bottom layer – 3×3 grid, offset 2.5 m, z = 0 m (on stadium columns, pinned)
+            for row in range(3):
+                for col in range(3):
+                    nodes_s.append([col * 5.0 + 2.5, row * 5.0 + 2.5, 0.0, 1, 1, 1])
+
+            st.session_state['nodes_data'] = pd.DataFrame(
+                nodes_s,
+                columns=["X", "Y", "Z", "Restrain_X", "Restrain_Y", "Restrain_Z"]
+            )
+
+            # 2. MEMBERS
+            members_s = []
+            tc_x_grp, tc_y_grp, bc_x_grp, bc_y_grp, web_grp = [], [], [], [], []
+
+            # Top chord – X direction (4 rows × 3 spans = 12 members)
+            for row in range(4):
+                for col in range(3):
+                    ni = row * 4 + col + 1
+                    nj = row * 4 + col + 2
+                    members_s.append([ni, nj, 0.008, 2e11])
+                    tc_x_grp.append(len(members_s))
+
+            # Top chord – Y direction (3 spans × 4 cols = 12 members)
+            for row in range(3):
+                for col in range(4):
+                    ni = row * 4 + col + 1
+                    nj = (row + 1) * 4 + col + 1
+                    members_s.append([ni, nj, 0.008, 2e11])
+                    tc_y_grp.append(len(members_s))
+
+            # Bottom chord – X direction (3 rows × 2 spans = 6 members)
+            for row in range(3):
+                for col in range(2):
+                    ni = 16 + row * 3 + col + 1
+                    nj = 16 + row * 3 + col + 2
+                    members_s.append([ni, nj, 0.006, 2e11])
+                    bc_x_grp.append(len(members_s))
+
+            # Bottom chord – Y direction (2 spans × 3 cols = 6 members)
+            for row in range(2):
+                for col in range(3):
+                    ni = 16 + row * 3 + col + 1
+                    nj = 16 + (row + 1) * 3 + col + 1
+                    members_s.append([ni, nj, 0.006, 2e11])
+                    bc_y_grp.append(len(members_s))
+
+            # Web diagonals – each bottom node connects to 4 surrounding top nodes (9×4 = 36)
+            for br in range(3):
+                for bc in range(3):
+                    b_id = 16 + br * 3 + bc + 1
+                    for tr in [br, br + 1]:
+                        for tc in [bc, bc + 1]:
+                            t_id = tr * 4 + tc + 1
+                            members_s.append([b_id, t_id, 0.005, 2e11])
+                            web_grp.append(len(members_s))
+
+            st.session_state['members_data'] = pd.DataFrame(
+                members_s,
+                columns=["Node_I", "Node_J", "Area(sq.m)", "E (N/sq.m)"]
+            )
+
+            # 3. LOADS
+            # Gravity (DL): 20 kN downward on every top chord node
+            loads_s = [[i + 1, 0.0, 0.0, -20000.0, "DL"] for i in range(16)]
+            # Wind (WL): uplift + lateral on the windward half (x ≤ 7.5 m → nodes 1-8)
+            for i in range(8):
+                loads_s.append([i + 1, 6000.0, 0.0, 12000.0, "WL"])
+
+            st.session_state['loads_data'] = pd.DataFrame(
+                loads_s,
+                columns=["Node_ID", "Force_X (N)", "Force_Y (N)", "Force_Z (N)", "Load_Case"]
+            )
+
+            # 4. LOAD COMBINATIONS (IS 875 aligned)
+            st.session_state['combos_data'] = pd.DataFrame([
+                ["Gravity Only (1.5 DL)",           1.5, 0.0],
+                ["Wind + Gravity (1.2 DL + 1.5 WL)", 1.2, 1.5],
+            ], columns=["Combo_Name", "Factor_DL", "Factor_WL"])
+
+            # 5. SHAPE OPTIMISATION BOUNDS
+            # Allow AI to lift/lower the 4 interior top-chord nodes (crown nodes)
+            # for camber optimisation while keeping perimeter nodes fixed
+            shape_s = []
+            interior_top = [6, 7, 10, 11]  # nodes at (5,5), (10,5), (5,10), (10,10)
+            for nid in interior_top:
+                shape_s.append([nid, -0.5, 0.5, -0.5, 0.5, 0.0, 1.5])  # allow z up to +1.5 m camber
+            st.session_state['shape_bounds_data'] = pd.DataFrame(
+                shape_s,
+                columns=["Node_ID", "dX_min", "dX_max", "dY_min", "dY_max", "dZ_min", "dZ_max"]
+            )
+
+            # 6. SYMMETRY GROUPS  (5 groups: TC-X, TC-Y, BC-X, BC-Y, Web)
+            stadium_groups = [
+                ", ".join(str(m) for m in tc_x_grp),
+                ", ".join(str(m) for m in tc_y_grp),
+                ", ".join(str(m) for m in bc_x_grp),
+                ", ".join(str(m) for m in bc_y_grp),
+                ", ".join(str(m) for m in web_grp),
+            ]
+            st.session_state['group_input_val'] = "; ".join(stadium_groups)
+            clear_results()
+
     st.subheader("Nodes")
     node_df = st.data_editor(st.session_state['nodes_data'], num_rows="dynamic", key="nodes", on_change=clear_results)
 
@@ -551,19 +665,8 @@ with col1:
                             st.success("🎉 MINLP Optimization Converged Successfully!")
                             st.session_state['optimized_sections'] = final_sections
                             st.session_state['optimized_shape'] = final_node_shifts
-
-                            # Use catalog Weight_kg_m for baseline — consistent with how
-                            # the optimizer computed final_weight (fixes density-hack mismatch)
-                            from is_catalog import get_isa_catalog
-                            cat_ref = get_isa_catalog()
-                            orig_weight = 0.0
-                            for mbr in base_ts.members:
-                                match = cat_ref[cat_ref['Area_m2'].between(mbr.A * 0.999, mbr.A * 1.001)]
-                                if not match.empty:
-                                    orig_weight += mbr.L * match.iloc[0]['Weight_kg_m']
-                                else:
-                                    orig_weight += mbr.A * mbr.L * 7850
-
+                            
+                            orig_weight = sum([mbr.A * mbr.L * 7850 for mbr in base_ts.members])
                             weight_saved = orig_weight - final_weight
                             pct_saved = (weight_saved / orig_weight) * 100 if orig_weight > 0 else 0
                             
@@ -679,29 +782,18 @@ with col1:
         from report_gen import generate_pdf_report
         
         if st.button("⚙️ Generate Professional PDF Report"):
-            with st.spinner("Generating PDF report..."):
+            with st.spinner("Compiling LaTeX document (pdflatex)..."):
                 try:
                     base_ts = st.session_state['solved_truss']
                     fig_base_img = st.session_state.get('base_fig', None)
                     fig_res_img = st.session_state.get('current_fig', None)
-
+                    
                     opt_payload = None
                     if 'optimized_sections' in st.session_state:
+                        orig_w = sum([mbr.A * mbr.L * 7850 for mbr in base_ts.members])
                         from is_catalog import get_isa_catalog
                         cat = get_isa_catalog()
-
-                        # Use catalog Weight_kg_m for both baseline and optimized weight so
-                        # the comparison is apples-to-apples (fixes density-hack inconsistency)
-                        orig_w = 0.0
-                        for mbr in base_ts.members:
-                            match = cat[cat['Area_m2'].between(mbr.A * 0.999, mbr.A * 1.001)]
-                            if not match.empty:
-                                orig_w += mbr.L * match.iloc[0]['Weight_kg_m']
-                            else:
-                                # Fallback: derive from area using steel density
-                                orig_w += mbr.A * mbr.L * 7850
-
-                        final_w = 0.0
+                        final_w = 0
                         for mbr in base_ts.members:
                             if mbr.id in st.session_state['optimized_sections']:
                                 sec_name = st.session_state['optimized_sections'][mbr.id]
@@ -709,13 +801,11 @@ with col1:
                                 final_w += mbr.L * w_per_m
                             else:
                                 final_w += mbr.A * mbr.L * 7850
-
+                                
                         opt_payload = {
                             'sections': st.session_state['optimized_sections'],
                             'orig_weight': orig_w,
-                            'final_weight': final_w,
-                            # Include node_shifts so Section 3.3 of the PDF is populated
-                            'node_shifts': st.session_state.get('optimized_shape', {}),
+                            'final_weight': final_w
                         }
                     
                     pdf_bytes = generate_pdf_report(
